@@ -57,9 +57,26 @@ dongle owner thread
 | `play --band fm` | Scan, number the hits, listen to the index you type. `q` quits. |
 | `--device 0\|1` | Which dongle. Default 0. |
 
-Named bands: `fm` (88–108), `air` (118–137), `ham2m` (144–148), `ham70cm` (420–450). Default sample rate 2.4 MHz. Each hop is one sample-rate wide.
+Named bands: `fm` (88–108), `air` (118–137), `ham2m` (144–148), `ham70cm` (420–450), `activity` (118–174). `activity` is the sweep for signals people actually go looking for: airband voice, ham, marine, and NOAA weather. Default sample rate 2.4 MHz. Each hop is one sample-rate wide. `scan` with no `--band` and no `--start` uses `activity`.
 
-A hit is interesting when a bin is at least 5 dB above the median power of that hop and at least 50 kHz from the previous hit. Sort strongest first.
+## Interesting hits
+
+People who sweep a dongle are not looking for "anything above the noise." They look for a change from the local floor, and they look in places where voice and short bursts live (rtl-sdr hobby writeups, SDRwatch's median-floor detector, riotduck's "learn normal and flag the delta," and walkthroughs that separate continuous FM from intermittent two-way radio).
+
+A bin becomes a candidate when its power is at least 5 dB above the **median** of that hop. The median, not the mean, so one strong station does not lift the floor and hide everything else. Candidates within 25 kHz of the hop center are dropped. That spike is the RTL-SDR DC artifact, unless the bin is also a hunt frequency. Candidates closer than 50 kHz collapse into one hit, keeping the stronger one. A hit needs either a contiguous width of at least two FFT bins, or a hunt-list match. A lone bin that is not on the hunt list is a spur and is not interesting.
+
+Each kept hit gets one reason, first match wins:
+
+| Reason | Rule |
+|---|---|
+| `hunt` | Within 25 kHz of a watch frequency: 121.500 (air guard), 144.390 (APRS), 145.800 (ISS SSTV), 146.520 (2 m calling), 156.800 (marine 16), 162.400 / 162.425 / 162.450 / 162.475 / 162.500 / 162.525 / 162.550 (NOAA weather), 433.920 (ISM), 446.000 (PMR446), 1090.000 (ADS-B). |
+| `narrow_in_wide` | Inside 88–108 MHz and −6 dB width under 50 kHz. Broadcast FM is about 150–200 kHz wide. A narrow carrier there is the odd one. |
+| `voice` | Inside airband (118–137), marine (156–162), or the 2 m / 70 cm ham ranges, and not already `hunt`. |
+| `active` | Passed the floor, width, and DC checks, and none of the above. |
+
+Sort `hunt`, then `narrow_in_wide`, then `voice`, then `active`. Inside a reason, strongest relative dBm first.
+
+`is_new` stays for a later baseline (riotduck-style: present now, absent on the previous pass). The first build has no stored baseline, so `is_new` is false. The TODO for peak log and alert is where that comparison lands. Do not pretend a one-pass sweep knows what "new" means.
 
 `listen` fills in `--mode` from the label when you omit it: `fm_broadcast` → `wfm`, `airband_am` → `am`, other analog labels → `nfm`. `play` does that. `palmetto800` does not get a mode.
 
@@ -69,7 +86,7 @@ Before audio starts, `listen` prints the tuned frequency, the −6 dB bandwidth,
 
 Bound to `127.0.0.1` only. This is the contract the UI build will call. Do not change the paths when the UI arrives. Add routes. Do not rename these.
 
-- `GET /api/sweep?start=&stop=` — `start` and `stop` are MHz. Returns hits and one power sample per hop: frequency Hz, relative dBm, bandwidth Hz, band label, `is_new`. Floats are JSON numbers, not `np.float64`.
+- `GET /api/sweep?start=&stop=` — `start` and `stop` are MHz. Omit both and the band is `activity` (118–174). Returns hits: frequency Hz, relative dBm, bandwidth Hz, band label, `reason` (`hunt`, `narrow_in_wide`, `voice`, or `active`), and `is_new` (always false in this build). Floats are JSON numbers, not `np.float64`.
 - `GET /api/zoom?freq_hz=` — retune, return spectrum dB relative to the peak, a short waterfall, peak Hz, bandwidth Hz, and the band label.
 - `POST /api/listen` body `{freq_hz, mode}` with `mode` one of `wfm`, `nfm`, `am`. `palmetto800` returns 409 and the label. No audio starts.
 - `POST /api/listen/stop` — stop demod and release the tune. The device stays open for the next sweep.
@@ -145,7 +162,7 @@ pytest, no hardware, fake `RtlSdr` where a device object is required.
 
 - `demod.py`: a synthesized NFM tone comes back near the modulating frequency. An AM tone comes back. Silence in, silence out. PCM length matches 48 kHz.
 - `bands.py`: 88.5 MHz is `fm_broadcast` / `wfm`. 121.5 MHz is `airband_am` / `am`. 146.52 MHz is `nfm_voice` / `nfm`. 852.35 MHz and 773.66 MHz are `palmetto800` with no mode. 433.92 MHz is `unknown` / `nfm`.
-- Scanner: a bin 5 dB above the hop median is a hit. A quieter bin is not. Two hits 20 kHz apart collapse to one.
+- Scanner: a bin 5 dB above the hop median and at least two bins wide is a hit. A quieter bin is not. A single bin off the hunt list is not. The DC bin at the hop center is not, unless it is a hunt frequency. Two candidates 20 kHz apart collapse to one. 144.390 MHz is `hunt`. A 20 kHz-wide carrier at 100 MHz is `narrow_in_wide`. A wide carrier at 88.5 MHz is `active`. 122.800 MHz is `voice`. `scan` with no band uses 118–174 MHz.
 - API: `POST /api/listen` at 852.35 MHz returns 409. `GET /api/sweep` against a fake dongle returns JSON-safe floats.
 
 `.venv/bin/python -m pytest` stays the command. The manual check in QUICKSTART is `./run_radio.sh play --band fm --device 1` and hearing 88.50 MHz.
