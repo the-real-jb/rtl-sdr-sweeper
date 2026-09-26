@@ -17,6 +17,7 @@ import http.server
 import json
 import queue
 import select
+import socket
 import struct
 import threading
 from typing import Callable, Optional
@@ -153,6 +154,31 @@ def _ws_send_binary(wfile, data: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Custom HTTPServer that lets WebSocket connections outlive their handler
+# ---------------------------------------------------------------------------
+
+
+class _RadioHTTPServer(http.server.HTTPServer):
+    """HTTPServer that skips shutdown_request for registered WebSocket sockets.
+
+    After _handle_ws_audio sends the 101 response it registers the raw socket
+    here and returns immediately (C1 fix). serve_forever is then free to accept
+    the next HTTP request. The WebSocket daemon thread calls shutdown_request
+    itself when it is done.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._ws_sockets: set = set()
+
+    def shutdown_request(self, request) -> None:  # type: ignore[override]
+        if request in self._ws_sockets:
+            # Daemon thread owns this socket; do not shut it down here.
+            return
+        super().shutdown_request(request)
+
+
+# ---------------------------------------------------------------------------
 # RadioService
 # ---------------------------------------------------------------------------
 
@@ -185,7 +211,7 @@ class RadioService:
         self._listening = False
         self._device_open = False
         self._device_error = ""
-        self._httpd: Optional[http.server.HTTPServer] = None
+        self._httpd: Optional[_RadioHTTPServer] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._http_thread: Optional[threading.Thread] = None
         self.port: int = 0
@@ -198,8 +224,8 @@ class RadioService:
         """Start the owner thread and HTTP server. Binds 127.0.0.1 only."""
         self._stop_event.clear()
         handler_class = self._make_handler()
-        # HTTPServer (not ThreadingHTTPServer) — one thread owns requests.
-        self._httpd = http.server.HTTPServer((host, port), handler_class)
+        # _RadioHTTPServer (not ThreadingHTTPServer) — one thread owns requests.
+        self._httpd = _RadioHTTPServer((host, port), handler_class)
         # Port 0 → OS picks; store the actual bound port.
         self.port = self._httpd.server_address[1]
 
@@ -276,9 +302,13 @@ class RadioService:
 
             elif kind == "listen":
                 _, freq_hz, mode, result_q = item
-                # Respond immediately so the HTTP handler can return 200.
+                # ACK immediately so the HTTP handler can return 200 without
+                # waiting for the demod loop to finish.
                 result_q.put({"ok": True})
-                self._do_listen(freq_hz, mode)
+                # Run demod, then retune if _do_listen says so (C3 fix).
+                retune = self._do_listen(freq_hz, mode)
+                while retune[0] is not None:
+                    retune = self._do_listen(*retune)
 
             elif kind == "stop_listen":
                 # TODO peak-log: append timestamp, Hz, dBm, label; alert when is_new flips
@@ -322,22 +352,37 @@ class RadioService:
         hits = scan_spectrum(sweep_data)
         return {"hits": [_hit_to_dict(h) for h in hits]}
 
-    def _do_listen(self, freq_hz: float, mode: str) -> None:
+    def _do_listen(
+        self, freq_hz: float, mode: str
+    ) -> tuple[Optional[float], Optional[str]]:
         """Demodulate on the owner thread, push PCM to the audio queue.
 
-        The loop checks _work_queue each iteration so a stop_listen item
-        posted by the HTTP handler can interrupt it.
-        Reads IQ from the owner thread — never from the HTTP thread.
+        Returns (new_freq, new_mode) if a second listen request arrived while
+        this one was running (C3: second listen cancels and retunes), or
+        (None, None) if stopped cleanly.
+
+        The queue drain at the top of each iteration lets stop_listen and a
+        second listen interrupt the loop promptly without blocking the owner
+        thread on a long read.
         """
         # TODO dual-dongle: run FFT sweep on device 0 while device 1 plays audio
         self._listening = True
+        _retune: tuple[Optional[float], Optional[str]] = (None, None)
+
         while self._listening and not self._stop_event.is_set():
-            # Drain any pending work (e.g. stop_listen) before next IQ read.
+            # Drain any pending work before reading IQ (keeps stop latency low).
             try:
                 item = self._work_queue.get_nowait()
                 if item[0] == "stop_listen":
                     item[1].put({"ok": True})
                     self._listening = False
+                    break
+                elif item[0] == "listen":
+                    # C3: a second listen arrived — cancel this one, retune.
+                    _, new_freq, new_mode, result_q = item
+                    result_q.put({"ok": True})
+                    self._listening = False
+                    _retune = (new_freq, new_mode)
                     break
                 elif item[0] == "sweep":
                     item[3].put({"error": "busy listening", "hits": []})
@@ -360,6 +405,8 @@ class RadioService:
                 self._audio_queue.put_nowait(pcm)
             except queue.Full:
                 pass
+
+        return _retune
 
     # ------------------------------------------------------------------
     # HTTP handler factory
@@ -423,19 +470,15 @@ class RadioService:
                     body = json.loads(self.rfile.read(length) or b"{}")
                     freq_hz = float(body.get("freq_hz", 0))
                     mode = body.get("mode", "")
-
-                    label = classify(freq_hz)
-                    if label == "palmetto800":
-                        # TODO P25/DMR: add clear P25 CAI and DMR demodulators; do not read encryption keys
-                        # Palmetto 800 is P25 CAI — NFM demod makes no speech here.
-                        self._send_json(409, {"label": "palmetto800"})
-                        return
-
+                    # I3: single palmetto check — PalmettoRefused from service.listen()
+                    # is the authoritative path; no redundant classify call here.
                     try:
                         service.listen(freq_hz, mode)
                         self._send_json(200, {"ok": True})
-                    except PalmettoRefused as exc:
-                        self._send_json(409, {"label": str(exc)})
+                    except PalmettoRefused:
+                        # TODO P25/DMR: add clear P25 CAI and DMR demodulators; do not read encryption keys
+                        # Palmetto 800 is P25 CAI — NFM demod makes no speech here.
+                        self._send_json(409, {"label": "palmetto800"})
 
                 elif path == "/api/listen/stop":
                     result_q: queue.Queue = queue.Queue()
@@ -455,10 +498,17 @@ class RadioService:
                 self.wfile.write(data)
 
             def _handle_ws_audio(self) -> None:
-                """Upgrade the connection to WebSocket and stream PCM audio.
+                """Upgrade to WebSocket and hand off to a daemon send-thread.
 
-                Sends one JSON text frame first: {"rate": 48000, "channels": 1,
-                "format": "s16le"}.  Binary PCM s16le frames follow.
+                C1 fix: after sending 101 and registering the socket in
+                _ws_sockets, this method returns immediately so serve_forever
+                can accept the next HTTP request (e.g. POST /api/listen/stop).
+
+                The daemon thread owns the socket for its lifetime:
+                  - Sends the JSON metadata text frame first.
+                  - Streams binary PCM s16le frames from the audio queue.
+                  - On client close or OSError, clears service._listening (C2+I1)
+                    and calls server.shutdown_request to clean up the socket.
 
                 GET /api/audio is the contract the CLI and later UI will use.
                 Do not rename or move the route.
@@ -478,33 +528,71 @@ class RadioService:
                 self.wfile.write(upgrade_resp.encode())
                 self.wfile.flush()
 
-                try:
-                    # First frame is always the JSON metadata text frame.
-                    _ws_send_text(self.wfile, json.dumps(_AUDIO_INFO))
+                # Register socket so _RadioHTTPServer skips shutdown_request.
+                conn = self.connection
+                self.server._ws_sockets.add(conn)
 
-                    # Stream PCM until client closes or service stops.
-                    while not service._stop_event.is_set():
-                        # Poll socket for incoming frames (e.g. close frame).
-                        r, _, _ = select.select([self.connection], [], [], 0.05)
-                        if r:
-                            frame_bytes = self.connection.recv(4096)
-                            if not frame_bytes:
-                                break
-                            opcode = frame_bytes[0] & 0x0F
-                            if opcode == 0x08:  # Close frame
-                                # Echo close frame to complete the handshake.
-                                _ws_send_frame(self.wfile, 0x08, b"")
-                                break
+                # Create a separate write file for the daemon thread.
+                # makefile() increments _io_refs so the socket stays alive after
+                # finish() closes the handler's wfile/rfile.
+                ws_wfile = conn.makefile("wb", buffering=0)
 
-                        # Send available PCM frames.
+                def ws_sender(conn=conn, ws_wfile=ws_wfile) -> None:
+                    """Send PCM over WebSocket; runs on its own daemon thread."""
+                    try:
+                        # First frame: audio format metadata (text).
+                        _ws_send_text(ws_wfile, json.dumps(_AUDIO_INFO))
+
+                        # Stream PCM frames until client closes or service stops.
+                        while not service._stop_event.is_set():
+                            # Poll for incoming frames (close frame from client).
+                            r, _, _ = select.select([conn], [], [], 0.05)
+                            if r:
+                                try:
+                                    data = conn.recv(4096)
+                                except OSError:
+                                    break
+                                if not data or (data[0] & 0x0F) == 0x08:
+                                    # Echo WebSocket close frame to complete handshake.
+                                    try:
+                                        _ws_send_frame(ws_wfile, 0x08, b"")
+                                    except OSError:
+                                        pass
+                                    break
+
+                            # Send available PCM.
+                            try:
+                                pcm = service._audio_queue.get_nowait()
+                                _ws_send_binary(ws_wfile, pcm.tobytes())
+                            except queue.Empty:
+                                pass
+
+                    except OSError:
+                        pass  # Unclean drop; fall through to finally.
+                    finally:
+                        # C2+I1: client gone — stop the demod loop so the dongle
+                        # is released. A 2-second grace period could be added here
+                        # to ride out brief reconnects; skipped in this build.
+                        service._listening = False
+                        service._httpd._ws_sockets.discard(conn)
                         try:
-                            pcm = service._audio_queue.get_nowait()
-                            _ws_send_binary(self.wfile, pcm.tobytes())
-                        except queue.Empty:
+                            ws_wfile.close()
+                        except OSError:
+                            pass
+                        try:
+                            # Full close: shut down both directions then release FD.
+                            conn.shutdown(socket.SHUT_RDWR)
+                            conn.close()
+                        except OSError:
                             pass
 
-                except OSError:
-                    pass  # Client disconnected; nothing to do.
+                t = threading.Thread(
+                    target=ws_sender, daemon=True, name="radio-ws"
+                )
+                t.start()
+                # Return immediately. serve_forever is now free for the next
+                # HTTP request. shutdown_request is skipped by _RadioHTTPServer
+                # until ws_sender cleans up (C1 fix).
 
             def log_message(self, *args: object) -> None:  # noqa: D401
                 pass  # Suppress HTTP access logs during tests.

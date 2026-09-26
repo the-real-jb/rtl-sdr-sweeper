@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import inspect
 import json
-from urllib.error import HTTPError
+import threading
+import time
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -152,3 +154,102 @@ def test_todo_markers_in_source():
     src = inspect.getsource(radio_service)
     for marker in radio_service.TODO_MARKERS:
         assert marker in src, f"TODO marker missing from source: {marker!r}"
+
+
+# ---------------------------------------------------------------------------
+# Round-1 regression tests (C1, C2, C3)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_while_streaming(http_service):
+    """C1+I2: POST /api/listen/stop must succeed while a WebSocket is live.
+
+    With the old code _handle_ws_audio blocked the HTTP thread; stop could
+    never be accepted while the WebSocket connection was open.
+    """
+    # Start a listen on a non-palmetto frequency so _do_listen begins.
+    data = json.dumps({"freq_hz": 144.0e6, "mode": "nfm"}).encode()
+    urlopen(Request(
+        http_service + "/api/listen",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    ))
+
+    ws_url = http_service.replace("http://", "ws://") + "/api/audio"
+    ws_ready = threading.Event()
+
+    def hold_ws():
+        with websockets.sync.client.connect(ws_url) as ws:
+            ws.recv()          # receive JSON metadata frame
+            ws_ready.set()     # signal: WebSocket is now live
+            time.sleep(10.0)   # hold open much longer than the stop timeout (3 s)
+
+    ws_thread = threading.Thread(target=hold_ws, daemon=True)
+    ws_thread.start()
+    ws_ready.wait(timeout=3)   # wait until WS connection is established
+
+    # With C1 unfixed the HTTP thread is stuck in _handle_ws_audio and this
+    # request can never be answered within the timeout.
+    stop_resp = urlopen(
+        Request(http_service + "/api/listen/stop", data=b"", method="POST"),
+        timeout=3,
+    )
+    assert stop_resp.getcode() == 200
+    ws_thread.join(timeout=3)
+
+
+def test_ws_disconnect_releases_demod(http_service):
+    """C2: Closing the WebSocket must eventually stop _do_listen.
+
+    With the old code _listening was never cleared, so the owner thread stayed
+    stuck in the demod loop and sweep requests got 'busy' back.
+    """
+    # Start a listen
+    data = json.dumps({"freq_hz": 144.0e6, "mode": "nfm"}).encode()
+    urlopen(Request(
+        http_service + "/api/listen",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    ))
+
+    ws_url = http_service.replace("http://", "ws://") + "/api/audio"
+    with websockets.sync.client.connect(ws_url) as ws:
+        ws.recv()   # consume JSON frame; exiting the `with` sends a Close frame
+
+    time.sleep(0.3)  # allow daemon thread to clear _listening
+
+    # Sweep must work now — not return {"error": "busy listening"}
+    raw = urlopen(http_service + "/api/sweep?start=144&stop=146").read()
+    body = json.loads(raw)
+    assert "error" not in body, f"owner still busy after WS disconnect: {body}"
+    assert "hits" in body
+
+
+def test_second_listen_retunes(http_service):
+    """C3: A second POST /api/listen must cancel the current and retune.
+
+    With the old code the second listen item was silently discarded in
+    _do_listen's queue drain, leaving service.listen() blocking for 30 s.
+    """
+    data1 = json.dumps({"freq_hz": 144.0e6, "mode": "nfm"}).encode()
+    urlopen(Request(
+        http_service + "/api/listen",
+        data=data1,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    ))
+
+    data2 = json.dumps({"freq_hz": 145.0e6, "mode": "nfm"}).encode()
+    # With C3 unfixed this blocks up to 30 s and the timeout raises URLError.
+    r2 = urlopen(
+        Request(
+            http_service + "/api/listen",
+            data=data2,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        ),
+        timeout=5,
+    )
+    assert r2.getcode() == 200
