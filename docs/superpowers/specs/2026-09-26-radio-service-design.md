@@ -4,66 +4,92 @@ Date: 2026-09-26
 
 ## Intent
 
-Find interesting signals and listen to them from the command line. The first slice is a backend you can play with: scan a band, print the hits, pick one, and hear it on this machine's speakers. A browser viewer is a later client of the same objects. It is not part of the first slice.
+Ship a backend you can use today, then a UI that calls the same API. The first build scans a band, lists the interesting hits, and plays analog audio on the speakers. The browser is the next build. It is not part of this one.
 
-Success for the first slice looks like this:
+Success for the backend looks like this:
 
-- `./run_radio.sh scan --band fm` prints ranked hits with frequency, relative dBm, bandwidth, and a band label. The known 88.50 MHz FM carrier shows up on a live dongle.
+- `./run_radio.sh` starts the service on `127.0.0.1`.
+- `./run_radio.sh scan --band fm` prints ranked hits: frequency, relative dBm, bandwidth, band label. A live dongle shows the known 88.50 MHz FM carrier.
 - `./run_radio.sh listen --freq 88.5 --mode wfm` plays that station on the speakers until Ctrl+C.
-- `./run_radio.sh play --band fm` scans, prints a numbered list, and listens to the number you type.
-- A Palmetto 800 hit is labeled and refused for analog listen. The command tells you to use SDRTrunk.
-- pytest covers demodulation, band labels, and the interesting-hit rule with synthetic IQ. Opening a real dongle stays a manual check.
-
-The longer-term service (a scanner thread that keeps running while a second dongle listens, then an HTTP API and a browser) stays the target architecture. Do not build it in the first slice.
+- `./run_radio.sh play --band fm` scans, numbers the hits, and listens to the number you type.
+- A Palmetto 800 frequency returns HTTP 409. The CLI prints that SDRTrunk is the player and does not demodulate.
+- The source carries `TODO` comments for the follow-on work listed below. Those comments are the backlog. They are not implementations.
+- pytest covers demodulation, band labels, the interesting-hit rule, and the 409 with synthetic IQ. Opening a real dongle stays a manual check.
 
 ## What you asked for
 
-Find signals, investigate them, and listen. Hear FM broadcast, narrow FM voice, and airband AM. Identify unknown signals. Treat Palmetto 800 audio as something SDRTrunk already does. Write comments and docstrings, and keep README.md and QUICKSTART.md current as the code lands. Prefer a working backend over a UI.
+A) Get the backend working, including the HTTP API a later UI will call.
+
+B) After that backend works, add a UI that consumes those routes. Do not start the UI in this build.
+
+C) Leave `TODO` comments in the modules that would grow, for SDRTrunk, clear P25 and DMR demodulation, JMBE, and the other enhancements below.
+
+Also: hear FM broadcast, narrow FM voice, and airband AM. Write docstrings and comments that say why. Update README.md and QUICKSTART.md in the same change that adds the command.
 
 ## Constraints
 
-- Host is Ubuntu. Two RTL2838 dongles with R820T/2 tuners, index 0 serial `00000978` and index 1 serial `00001090`.
-- pyrtlsdr 0.5.0 imports `rtlsdr.RtlSdr`. The system `librtlsdr` lacks `rtlsdr_set_dithering`. `~/.local/lib` holds a build that has the symbol. Launch scripts export `LD_LIBRARY_PATH`.
-- libusb calls for a device stay on the thread that opened it. In the first slice that thread is the CLI main thread, because only one dongle is open at a time.
+- Host is Ubuntu. Two RTL2838 dongles with R820T/2 tuners, index 0 serial `00000978` and index 1 serial `00001090`. The backend opens one of them.
+- pyrtlsdr 0.5.0 imports `rtlsdr.RtlSdr`. The system `librtlsdr` lacks `rtlsdr_set_dithering`. `~/.local/lib` holds a build that has the symbol. `run_radio.sh` exports `LD_LIBRARY_PATH`.
+- libusb calls stay on the thread that opened the device. The HTTP handler does not call `read_samples` itself. It posts work to that thread. Do not use `ThreadingHTTPServer`.
 - Power figures are relative dBm, offset from `NOISE_FLOOR_DBM` (−95). They compare frequencies. They are not calibrated field strength.
-- `RtlSDRSweeper` and `AdvancedSweeper` stay the capture and FFT primitives. The new modules call them.
+- `RtlSDRSweeper` and `AdvancedSweeper` stay the capture and FFT primitives.
 
-## First slice
+## Backend
 
-One dongle. One process. No HTTP server.
+One process owns the dongle and serves the API. The CLI is a client of that API, which is the same contract the UI will use.
 
 ```
-scan_band() -> list of hits
-listen(freq, mode) -> PCM blocks written to the speakers
+dongle owner thread
+        |
+   radio_service  -- HTTP + PCM WebSocket on 127.0.0.1:8766
+        |
+   radio.py (scan / listen / play) -- sounddevice speakers
 ```
 
-`run_radio.sh` sets `LD_LIBRARY_PATH` and runs `radio.py`.
+`run_radio.sh` sets `LD_LIBRARY_PATH`. With no subcommand it starts the service. `scan`, `listen`, and `play` start the service if it is not already up, call it, and leave it running.
 
 | Command | What it does |
 |---|---|
-| `scan --band fm` | One FFT sweep of 88–108 MHz. Prints hits, strongest first. |
-| `scan --start 118 --stop 137` | Same, with explicit edges in MHz. |
+| `./run_radio.sh` | Serve the API. Default device 0, port 8766. |
+| `scan --band fm` | One FFT sweep of 88–108 MHz. Print hits, strongest first. |
+| `scan --start 118 --stop 137` | Same, edges in MHz. |
 | `listen --freq 88.5 --mode wfm` | Tune, demodulate, play until Ctrl+C. |
 | `play --band fm` | Scan, number the hits, listen to the index you type. `q` quits. |
 | `--device 0\|1` | Which dongle. Default 0. |
 
-Named bands: `fm` (88–108), `air` (118–137), `ham2m` (144–148), `ham70cm` (420–450). Default sample rate 2.4 MHz. Each hop is one sample-rate wide, so FM is about ten tunes, not a 100 kHz stepped power sweep.
+Named bands: `fm` (88–108), `air` (118–137), `ham2m` (144–148), `ham70cm` (420–450). Default sample rate 2.4 MHz. Each hop is one sample-rate wide.
 
-A hit is interesting when a bin is at least 5 dB above the median power of that hop and at least 50 kHz from the previous hit. The command prints the band label next to it. Sorting is by power, descending.
+A hit is interesting when a bin is at least 5 dB above the median power of that hop and at least 50 kHz from the previous hit. Sort strongest first.
 
-`listen` picks the mode from the label when you omit `--mode`: `fm` → `wfm`, `air` → `am`, anything else analog → `nfm`. `play` does that automatically. `palmetto800` prints the SDRTrunk hint and does not open the demodulator.
+`listen` fills in `--mode` from the label when you omit it: `fm_broadcast` → `wfm`, `airband_am` → `am`, other analog labels → `nfm`. `play` does that. `palmetto800` does not get a mode.
 
-Investigate, without a plot: `listen` prints the tuned frequency, the −6 dB bandwidth, and the label before audio starts. That is the check that a wide carrier is broadcast FM and a narrow one is voice.
+Before audio starts, `listen` prints the tuned frequency, the −6 dB bandwidth, and the label.
 
-## Components (first slice)
+## API
 
-| Module | Responsibility | Depends on |
-|---|---|---|
-| `demod.py` | FM discriminator, AM envelope, low-pass, resample to 48 kHz PCM. No USB. | numpy, scipy |
-| `bands.py` | Maps Hz to `fm_broadcast`, `airband_am`, `nfm_voice`, `palmetto800`, or `unknown`. Suggests a listen mode. | nothing |
-| `scanner.py` | Hops one open sweeper across a band. Returns hits. Not a background thread in this slice. | `AdvancedSweeper.analyze_with_fft`, `bands.py` |
-| `tuner.py` | Retunes, measures bandwidth, demodulates IQ into PCM blocks. | `AdvancedSweeper`, `demod.py`, `bands.py` |
-| `radio.py` | CLI for `scan`, `listen`, and `play`. Opens one dongle, plays PCM with `sounddevice`, closes the dongle in `finally`. | scanner, tuner |
+Bound to `127.0.0.1` only. This is the contract the UI build will call. Do not change the paths when the UI arrives. Add routes. Do not rename these.
+
+- `GET /api/sweep?start=&stop=` — `start` and `stop` are MHz. Returns hits and one power sample per hop: frequency Hz, relative dBm, bandwidth Hz, band label, `is_new`. Floats are JSON numbers, not `np.float64`.
+- `GET /api/zoom?freq_hz=` — retune, return spectrum dB relative to the peak, a short waterfall, peak Hz, bandwidth Hz, and the band label.
+- `POST /api/listen` body `{freq_hz, mode}` with `mode` one of `wfm`, `nfm`, `am`. `palmetto800` returns 409 and the label. No audio starts.
+- `POST /api/listen/stop` — stop demod and release the tune. The device stays open for the next sweep.
+- `GET /api/audio` — WebSocket. Binary PCM s16le, 48 kHz, mono. The CLI plays this with `sounddevice`.
+- `GET /api/health` — device index, whether the dongle opened, and the last error string.
+
+Hop spacing is the sample rate. The `step` query from the old viewer is not part of this API.
+
+## Modules
+
+| Module | Responsibility |
+|---|---|
+| `demod.py` | FM discriminator, AM envelope, low-pass, resample to 48 kHz. No USB. |
+| `bands.py` | Maps Hz to `fm_broadcast`, `airband_am`, `nfm_voice`, `palmetto800`, or `unknown`, and suggests a listen mode. |
+| `scanner.py` | Hops an open sweeper. Returns hits. Called on the dongle thread. |
+| `tuner.py` | Retunes, measures bandwidth, demodulates IQ to PCM. Called on the dongle thread. |
+| `radio_service.py` | Dongle thread, HTTP, WebSocket, `TODO` markers for later work. |
+| `radio.py` | CLI client. Speakers. No USB. |
+
+`signal_viewer.py` stays as the existing viewer. This build does not change `viewer.html`.
 
 ## Listening
 
@@ -73,72 +99,71 @@ Investigate, without a plot: `listen` prints the tuned frequency, the −6 dB ba
 | `nfm` | Ham, FRS, GMRS, marine. Deviation about 2.5–5 kHz. |
 | `am` | 118–137 MHz airband. |
 
-Speakers come from `sounddevice`, default output device, 48 kHz, mono, int16. Ctrl+C stops playback and closes the dongle.
+Speakers are the default `sounddevice` output, 48 kHz, mono, int16. Ctrl+C calls `/api/listen/stop` and closes the CLI. The service keeps running.
 
-## Later, not in this slice
+## TODO comments to leave in the code
 
-Keep these names stable so a UI can call the same functions, but do not implement them now:
+Put these in `radio_service.py` next to the function they would extend. Each one is a comment, not a stub that pretends to work. Wording can be shorter than this list. The point of each item stays.
 
-- A scanner thread on dongle 0 that keeps sweeping while dongle 1 listens.
-- HTTP on `127.0.0.1`: `/api/sweep`, `/api/zoom`, `/api/listen`, `/api/log`, and a PCM WebSocket.
-- Browser heatmap, click-to-zoom, and in-browser audio.
-- A second speaker client over that socket.
-- Tailing `/home/jb/SDRTrunk/recordings/`.
+1. **SDRTrunk incorporation.** Launcher is `/home/jb/apps/sdr-trunk-linux-x86_64-v0.6.1/bin/sdr-trunk`. User data is `/home/jb/SDRTrunk/` (`configuration/tuner_configuration.json`, `playlist/default.xml`, `recordings/`). SDRTrunk opens the dongle with usb4java and accepts no tune command. Later work can detect that it is running, avoid the USB index it holds, and list files it already wrote under `recordings/`. It does not remote-control SDRTrunk.
+2. **P25 and DMR demodulation.** Clear P25 (Palmetto 800 is P25 CAI, 769–775 MHz and 851–861 MHz downlink) and clear DMR need their own demodulators. Analog NFM on those carriers is not speech. Do not implement them in this build. Do not read, guess, or store encryption keys. Encrypted talkgroups stay inside SDRTrunk, where a key the operator already configured can play them.
+3. **JMBE.** `/home/jb/SDRTrunk/jmbe` turns clear P25 IMBE frames into PCM. A later demodulator calls that vocoder. It is not an encryption bypass.
+4. **Second dongle.** Keep an FFT sweep running on device 0 while device 1 plays audio.
+5. **Peak log and alert.** Append timestamp, Hz, relative dBm, and label to a file. Notify when `is_new` flips on.
+6. **Max-hold.** A transmission shorter than the hop time disappears. Keep the max per bin for a few passes.
+7. **Stereo WFM.** Decode the 19 kHz pilot and the L−R baseband. The first build is mono.
+8. **Finer names.** Map an FM hit to a channel number, and a ham hit to a calling frequency when it lands on one. The first build only has the five labels above.
 
-`signal_viewer.py` stays as it is. The first slice does not replace it.
+## UI, after the backend works
+
+A later change adds a page that calls the routes above. It shows the sweep, the hit list, a zoom from `/api/zoom`, and audio from `/api/audio`. It does not open a dongle and it does not add a second backend. That work starts only after `scan` and `listen` work against a real dongle.
 
 ## Palmetto 800 and SDRTrunk
 
-Palmetto 800 is South Carolina's statewide Motorola P25 system (RadioReference system 5042, P25 CAI). Site channels sit in the 700 MHz downlink, about 769–775 MHz, and the 800 MHz downlink, about 851–861 MHz. Control channels are per site. NFM demodulation of those carriers does not produce speech.
+Palmetto 800 is South Carolina's statewide Motorola P25 system (RadioReference system 5042, P25 CAI). Site control channels differ. NFM on those carriers does not produce speech.
 
-Installed pieces on this host:
+The saved tuner file has three R820T configs, centers 859.2375 MHz, 852.8625 MHz, and 101.1 MHz. The first two sit in the 800 MHz public-safety downlink. While SDRTrunk is running it holds those USB devices.
 
-- Launcher: `/home/jb/apps/sdr-trunk-linux-x86_64-v0.6.1/bin/sdr-trunk` (v0.6.1).
-- User data: `/home/jb/SDRTrunk/`, including `configuration/tuner_configuration.json`, `playlist/default.xml`, and `recordings/`.
-- SDRTrunk opens the dongle with usb4java. It has no rtl_tcp client and no HTTP API that accepts a tune command. `/home/jb/SDRTrunk/REMOTE-SDR.md` records that fact.
-- The saved tuner file lists three R820T configs, centers 859.2375 MHz, 852.8625 MHz, and 101.1 MHz. The first two are inside the 800 MHz public-safety downlink. While SDRTrunk is running it holds those USB devices.
+This build:
 
-First-slice behavior:
-
-- `bands.py` labels 769–775 MHz and 851–861 MHz as `palmetto800`.
-- `listen` and `play` refuse that label and print that SDRTrunk is the player. They do not demodulate.
-- A busy dongle prints which index failed and why. This project does not kill SDRTrunk.
-
-JMBE, under `/home/jb/SDRTrunk/jmbe`, turns clear P25 IMBE frames into PCM. That is vocoder decode. Some Palmetto talkgroups are encrypted. Encrypted audio plays only if a key is already configured inside SDRTrunk. This project does not read those keys, guess keys, or implement a decryptor.
+- Labels 769–775 MHz and 851–861 MHz as `palmetto800`.
+- Returns 409 from `POST /api/listen` and prints the SDRTrunk hint.
+- On `LIBUSB_ERROR_BUSY`, names the device index and exits the command non-zero. It does not kill SDRTrunk.
 
 ## Error handling
 
-- Missing or old `librtlsdr`: the CLI prints the same clear message the sweeper uses today and exits non-zero. It does not start a server.
-- `LIBUSB_ERROR_BUSY`: name the device index and exit non-zero. Do not retry in a loop.
-- Empty or clipped IQ: demod returns silence, not a NaN buffer.
-- Ctrl+C during `listen` or `play`: close the dongle before the process exits.
+- Missing or old `librtlsdr`: `/api/health` reports the error. `scan` and `listen` print it and exit non-zero.
+- `LIBUSB_ERROR_BUSY`: name the index. Do not retry in a loop.
+- A second listen or zoom cancels the current demod, then retunes. One owner thread.
+- Empty IQ: demod returns silence, not NaN.
+- Last WebSocket client gone for 2 seconds: stop demod so a dead CLI does not hold the tune.
+- Ctrl+C in the CLI: `POST /api/listen/stop`, then exit. The service process stays up.
 
 ## Testing
 
 pytest, no hardware, fake `RtlSdr` where a device object is required.
 
 - `demod.py`: a synthesized NFM tone comes back near the modulating frequency. An AM tone comes back. Silence in, silence out. PCM length matches 48 kHz.
-- `bands.py`: 88.5 MHz is `fm_broadcast` with mode `wfm`. 121.5 MHz is `airband_am` with mode `am`. 146.52 MHz is `nfm_voice`. 852.35 MHz and 773.66 MHz are `palmetto800` with no listen mode. 433.92 MHz is `unknown` with mode `nfm`.
+- `bands.py`: 88.5 MHz is `fm_broadcast` / `wfm`. 121.5 MHz is `airband_am` / `am`. 146.52 MHz is `nfm_voice` / `nfm`. 852.35 MHz and 773.66 MHz are `palmetto800` with no mode. 433.92 MHz is `unknown` / `nfm`.
 - Scanner: a bin 5 dB above the hop median is a hit. A quieter bin is not. Two hits 20 kHz apart collapse to one.
-- `radio.py`: choosing a `palmetto800` hit does not call the demodulator. `scan` output is sorted strongest first.
+- API: `POST /api/listen` at 852.35 MHz returns 409. `GET /api/sweep` against a fake dongle returns JSON-safe floats.
 
-`.venv/bin/python -m pytest` stays the command. The manual check in QUICKSTART is `./run_radio.sh play --band fm --device 1` and confirming you can hear 88.50 MHz.
+`.venv/bin/python -m pytest` stays the command. The manual check in QUICKSTART is `./run_radio.sh play --band fm --device 1` and hearing 88.50 MHz.
 
 ## Documentation
 
-Every new module gets a module docstring stating what it owns. Functions that hide a unit or a USB rule get a docstring. Comments explain why a hop is one sample-rate wide and why a Palmetto hit is not demodulated here.
+Every new module gets a module docstring that says what it owns and which thread may touch the dongle. Comments explain why a hop is one sample-rate wide, why Palmetto hits are not demodulated here, and why each `TODO` is waiting.
 
-The same change that adds `run_radio.sh` updates README.md and QUICKSTART.md with `scan`, `listen`, `play`, the band names, and the busy-dongle case.
+The change that adds `run_radio.sh` updates README.md and QUICKSTART.md with the commands, the band names, the API base URL, and the busy-dongle case.
 
-## Out of scope for the first slice
+## Out of scope for this build
 
-- HTTP, WebSocket, and any change to `viewer.html`.
-- Driving SDRTrunk or sending it a frequency.
-- P25, DMR, or ADS-B demodulation inside this process.
+- Changes to `viewer.html` or a new browser page.
+- Implementing the `TODO` items above.
+- Driving SDRTrunk, or parsing its playlist.
 - Reading, storing, or deriving encryption keys.
-- Stereo multiplex decode for WFM.
 - Calibrated dBm.
-- Scanning on one dongle while listening on the other.
+- Binding the HTTP port to anything but localhost.
 
 ## Implementation gate
 
