@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>RTL-SDR Signal Viewer</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0e1116; color: #e6e6e6; }
+  header { padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d; }
+  header h1 { font-size: 16px; margin: 0; }
+  .controls { padding: 10px 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .controls label { font-size: 12px; color: #9aa4b2; }
+  .controls input { width: 70px; background: #0e1116; color: #e6e6e6; border: 1px solid #30363d; border-radius: 4px; padding: 4px; }
+  button { background: #238636; color: #fff; border: 0; border-radius: 5px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  button:disabled { background: #30363d; cursor: default; }
+  .layout { display: flex; gap: 12px; padding: 0 16px 16px; }
+  .plots { flex: 1; min-width: 0; }
+  .sidebar { width: 260px; }
+  .peaklist { list-style: none; margin: 0; padding: 0; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+  .peaklist li { padding: 8px 10px; border-bottom: 1px solid #30363d; cursor: pointer; font-size: 13px; }
+  .peaklist li:hover { background: #1f2630; }
+  .peaklist li:last-child { border-bottom: 0; }
+  .peaklist .freq { font-weight: 600; color: #58a6ff; }
+  .peaklist .pw { color: #9aa4b2; float: right; }
+  #status { font-size: 12px; color: #9aa4b2; padding: 0 16px 8px; min-height: 16px; }
+  .info { font-size: 13px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px; margin-top: 10px; }
+  .info b { color: #58a6ff; }
+  h3 { font-size: 13px; color: #9aa4b2; margin: 8px 0 6px; text-transform: uppercase; letter-spacing: .5px; }
+  #spectrum, #waterfall, #zoomSpectrum, #zoomWaterfall { width: 100%; }
+</style>
+</head>
+<body>
+<header><h1>RTL-SDR Signal Viewer &mdash; spectrum &amp; waterfall</h1></header>
+
+<div class="controls">
+  <label>Start (MHz) <input id="start" type="number" value="88" step="0.5"></label>
+  <label>Stop (MHz) <input id="stop" type="number" value="108" step="0.5"></label>
+  <label>Step (kHz) <input id="step" type="number" value="500" step="50"></label>
+  <button id="sweepBtn" onclick="runSweep()">Run sweep</button>
+  <span id="status"></span>
+</div>
+
+<div class="layout">
+  <div class="plots">
+    <h3>Wideband spectrum (power vs frequency)</h3>
+    <div id="spectrum" style="height:280px"></div>
+    <h3>Wideband waterfall (time &darr;, color = power)</h3>
+    <div id="waterfall" style="height:220px"></div>
+    <h3>Zoom-in: narrowband spectrum</h3>
+    <div id="zoomSpectrum" style="height:260px"></div>
+    <h3>Zoom-in: narrowband waterfall</h3>
+    <div id="zoomWaterfall" style="height:220px"></div>
+  </div>
+  <div class="sidebar">
+    <h3>Detected signals (click to focus in)</h3>
+    <ul id="peaks" class="peaklist"></ul>
+    <div class="info" id="zoomInfo">Run a sweep, then click a detected signal to retune the dongle and zoom in.</div>
+  </div>
+</div>
+
+<script>
+const sweepRows = [];   // client-side waterfall history of successive sweeps
+let sweepFreqs = [];
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+async function runSweep() {
+  const btn = document.getElementById('sweepBtn');
+  btn.disabled = true;
+  setStatus('Sweeping (retuning the dongle across the band)...');
+  const start = document.getElementById('start').value;
+  const stop = document.getElementById('stop').value;
+  const step = document.getElementById('step').value;
+  try {
+    const r = await fetch(`/api/sweep?start=${start}&stop=${stop}&step=${step}`);
+    const data = await r.json();
+    if (data.error) { setStatus('Error: ' + data.error); return; }
+
+    Plotly.react('spectrum', [{
+      x: data.freqs_mhz, y: data.power_dbm, type: 'scatter', mode: 'lines',
+      line: { color: '#58a6ff' }, name: 'power'
+    }], baseLayout('Frequency (MHz)', 'Power (dBm, relative)'));
+
+    // Accumulate sweeps into a rolling waterfall.
+    sweepFreqs = data.freqs_mhz;
+    sweepRows.push(data.power_dbm);
+    if (sweepRows.length > 40) sweepRows.shift();
+    Plotly.react('waterfall', [{
+      z: sweepRows, x: sweepFreqs, type: 'heatmap', colorscale: 'Viridis',
+      colorbar: { title: 'dBm' }
+    }], baseLayout('Frequency (MHz)', 'Sweep #'));
+
+    renderPeaks(data.peaks || []);
+    setStatus(`Sweep done: ${data.freqs_mhz.length} points, ${(data.peaks||[]).length} signal(s) detected.`);
+  } catch (e) {
+    setStatus('Request failed: ' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderPeaks(peaks) {
+  const ul = document.getElementById('peaks');
+  ul.innerHTML = '';
+  if (!peaks.length) { ul.innerHTML = '<li>(none above threshold)</li>'; return; }
+  peaks.forEach((p) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="freq">${p.freq_mhz.toFixed(3)} MHz</span>` +
+                   `<span class="pw">${p.power_dbm.toFixed(1)} dBm</span>`;
+    li.onclick = () => zoomInto(p.freq_mhz);
+    ul.appendChild(li);
+  });
+}
+
+async function zoomInto(freqMhz) {
+  setStatus(`Focusing in: retuning to ${freqMhz.toFixed(3)} MHz...`);
+  document.getElementById('zoomInfo').innerHTML = 'Capturing narrowband data...';
+  try {
+    const r = await fetch(`/api/zoom?freq_hz=${Math.round(freqMhz * 1e6)}`);
+    const data = await r.json();
+    if (data.error) { setStatus('Zoom error: ' + data.error); return; }
+
+    Plotly.react('zoomSpectrum', [{
+      x: data.freqs_mhz, y: data.power_db, type: 'scatter', mode: 'lines',
+      line: { color: '#3fb950' }
+    }], baseLayout('Frequency (MHz)', 'Power (dB, rel. peak)'));
+
+    Plotly.react('zoomWaterfall', [{
+      z: data.waterfall, x: data.freqs_mhz, type: 'heatmap', colorscale: 'Viridis',
+      colorbar: { title: 'dB' }
+    }], baseLayout('Frequency (MHz)', 'Frame (time \u2193)'));
+
+    const bwKhz = (data.bandwidth_hz / 1e3);
+    const kind = classify(data.bandwidth_hz);
+    document.getElementById('zoomInfo').innerHTML =
+      `<b>Peak:</b> ${(data.peak_frequency_hz/1e6).toFixed(4)} MHz<br>` +
+      `<b>Est. bandwidth (-6 dB):</b> ${bwKhz.toFixed(1)} kHz<br>` +
+      `<b>Likely:</b> ${kind}`;
+    setStatus(`Zoom done at ${freqMhz.toFixed(3)} MHz; ~${bwKhz.toFixed(1)} kHz wide.`);
+  } catch (e) {
+    setStatus('Zoom request failed: ' + e);
+  }
+}
+
+function classify(bwHz) {
+  const khz = bwHz / 1e3;
+  if (khz >= 120) return 'wideband FM broadcast (~150-200 kHz)';
+  if (khz >= 40) return 'wide signal (data / TV / stereo)';
+  if (khz >= 8) return 'narrowband voice / NFM channel (~12.5-25 kHz)';
+  if (khz > 0) return 'very narrow (CW/beacon/carrier)';
+  return 'no clear signal';
+}
+
+function baseLayout(xtitle, ytitle) {
+  return {
+    margin: { l: 55, r: 10, t: 10, b: 40 },
+    paper_bgcolor: '#0e1116', plot_bgcolor: '#0e1116',
+    font: { color: '#c9d1d9', size: 11 },
+    xaxis: { title: xtitle, gridcolor: '#21262d' },
+    yaxis: { title: ytitle, gridcolor: '#21262d' },
+    showlegend: false,
+  };
+}
+</script>
+</body>
+</html>
