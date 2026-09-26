@@ -37,7 +37,7 @@ HUNT_HZ: tuple[float, ...] = (
 _PALMETTO_LOW = (769e6, 775e6)
 _PALMETTO_HIGH = (851e6, 861e6)
 _MARINE = (156e6, 162e6)
-_ISM_433_HZ = 433.920e6
+_ISM_433 = (433.05e6, 434.79e6)
 
 
 def _in_range(freq_hz: float, low_hz: float, high_hz: float) -> bool:
@@ -58,10 +58,10 @@ def classify(freq_hz: float) -> str:
     low, high = BANDS["ham2m"]
     if _in_range(freq_hz, low, high):
         return "nfm_voice"
+    if _in_range(freq_hz, *_ISM_433):
+        return "unknown"
     low, high = BANDS["ham70cm"]
     if _in_range(freq_hz, low, high):
-        if abs(freq_hz - _ISM_433_HZ) < 1.0:
-            return "unknown"
         return "nfm_voice"
     return "unknown"
 

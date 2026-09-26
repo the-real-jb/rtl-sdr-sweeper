@@ -8,6 +8,9 @@ def test_classify_known_ranges():
     assert classify(852.35e6) == "palmetto800"
     assert classify(773.66e6) == "palmetto800"
     assert classify(433.92e6) == "unknown"
+    assert classify(433.05e6) == "unknown"
+    assert classify(434.79e6) == "unknown"
+    assert classify(435.0e6) == "nfm_voice"
 
 
 def test_listen_mode():
