@@ -9,6 +9,7 @@ I/O need a real device and `librtlsdr`.
 - `freq_sweeper_advanced.py` — `AdvancedSweeper` subclass (windowed FFT, one-shot band sweep, pyqtgraph spectrum of the current center).
 - `freq_sweeper.py` — compatibility shim that re-exports the above and starts the pyqtgraph view.
 - `signal_viewer.py` + `viewer.html` — local HTTP viewer: wideband sweep, peak list, click-to-zoom FFT waterfall.
+- `radio_service.py`, `radio.py`, `run_radio.sh` — localhost radio backend (API on `127.0.0.1:8766`) and CLI client (`scan`, `listen`, `play`). The CLI is HTTP-only and never opens a dongle.
 - `test_freq_sweeper.py`, `test_signal_viewer.py` — pytest for the pure DSP/logic (no hardware).
 
 ## What it does today
@@ -55,6 +56,19 @@ handled one at a time so librtlsdr stays on the thread that opened the device.
   narrow carrier. The label comes from bandwidth alone.
 
 One dongle is open at a time. Relative power is the measurement throughout.
+
+## Radio backend
+
+`./run_radio.sh` starts the API on http://127.0.0.1:8766 (default device 0). Subcommands talk to that service:
+
+```bash
+./run_radio.sh scan --band fm              # 88–108 MHz interesting hits
+./run_radio.sh scan                        # default band activity (118–174 MHz)
+./run_radio.sh listen --freq 88.5 --mode wfm
+./run_radio.sh play --band fm              # scan, pick a hit number, listen
+```
+
+Hits are ranked by reason — `hunt` (watch frequencies), then `narrow_in_wide` (narrow carriers in FM broadcast), `voice` (air/marine/ham), then `active` — strongest relative dBm first within each group. Palmetto 800 (`769–775` / `851–861` MHz) returns HTTP 409; the CLI prints the SDRTrunk launcher path and exits 2.
 
 ## Running
 
