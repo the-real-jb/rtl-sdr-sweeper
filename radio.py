@@ -47,6 +47,19 @@ def format_hits(hits: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def ensure_sounddevice() -> int:
+    """Return 0 if sounddevice is installed, else print install hint and return 1."""
+    try:
+        import sounddevice  # noqa: F401
+    except ModuleNotFoundError:
+        print(
+            "Speaker playback requires sounddevice. Install with: uv pip install sounddevice",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def stop_listen(base_url: str) -> None:
     """POST /api/listen/stop so the service releases the tune."""
     url = f"{base_url.rstrip('/')}/api/listen/stop"
@@ -178,6 +191,9 @@ def _start_listen(
     if result.get("_http_code") == 409:
         print(_SDRTRUNK_PATH)
         return 2
+    if ensure_sounddevice() != 0:
+        stop_listen(base_url)
+        return 1
     try:
         _play_audio_ws(base_url)
     except KeyboardInterrupt:

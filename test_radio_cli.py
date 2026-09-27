@@ -1,4 +1,6 @@
-from radio import format_hits, stop_listen
+import builtins
+
+from radio import ensure_sounddevice, format_hits, stop_listen
 
 
 def test_format_orders_reasons():
@@ -32,3 +34,18 @@ def test_stop_listen_posts(monkeypatch):
     stop_listen("http://127.0.0.1:8766")
     assert seen["url"].endswith("/api/listen/stop")
     assert seen["method"] == "POST"
+
+
+def test_ensure_sounddevice_missing_hint(capsys, monkeypatch):
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "sounddevice":
+            raise ModuleNotFoundError("No module named 'sounddevice'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    code = ensure_sounddevice()
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "uv pip install sounddevice" in captured.err

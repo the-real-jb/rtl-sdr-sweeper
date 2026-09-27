@@ -68,7 +68,11 @@ One dongle is open at a time. Relative power is the measurement throughout.
 ./run_radio.sh play --band fm              # scan, pick a hit number, listen
 ```
 
+Named bands: `fm` (88–108 MHz), `air` (118–137), `ham2m` (144–148), `ham70cm` (420–450), `activity` (118–174, default when `scan` has no `--band` or `--start`).
+
 Hits are ranked by reason — `hunt` (watch frequencies), then `narrow_in_wide` (narrow carriers in FM broadcast), `voice` (air/marine/ham), then `active` — strongest relative dBm first within each group. Palmetto 800 (`769–775` / `851–861` MHz) returns HTTP 409; the CLI prints the SDRTrunk launcher path and exits 2.
+
+If the dongle is busy (`LIBUSB_ERROR_BUSY`), the CLI prints the error string from `GET /api/health` and exits non-zero.
 
 ## Running
 
