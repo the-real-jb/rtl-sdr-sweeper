@@ -18,7 +18,7 @@ API base URL: http://127.0.0.1:8766
 
 Interesting hits are sorted by reason: `hunt` (watch list), `narrow_in_wide` (narrow signal in FM broadcast), `voice` (air/marine/ham), then `active`, strongest first within each group. Palmetto 800 listen attempts print the SDRTrunk path and exit 2.
 
-Named bands: `fm`, `air`, `ham2m`, `ham70cm`, `activity` (default when `scan` has no `--band` or `--start`).
+Named bands: `fm`, `air`, `ham2m`, `ham70cm`, `activity` (default when `scan` has no `--band` or `--start`). `listen` calls `GET /api/zoom?freq_hz=` and prints the −6 dB bandwidth before audio starts.
 
 ## Sweep a band
 
@@ -75,7 +75,7 @@ Python deps live in `.venv`. Install with uv, not system `pip`:
 
 ```bash
 uv venv
-uv pip install numpy pyrtlsdr pytest sounddevice websockets
+uv pip install numpy pyrtlsdr pytest scipy sounddevice websockets
 uv pip install pyqtgraph pyqt5   # only for the live pyqtgraph window
 ```
 

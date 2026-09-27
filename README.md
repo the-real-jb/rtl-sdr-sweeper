@@ -74,6 +74,8 @@ Hits are ranked by reason — `hunt` (watch frequencies), then `narrow_in_wide` 
 
 If the dongle is busy (`LIBUSB_ERROR_BUSY`), the CLI prints the error string from `GET /api/health` and exits non-zero.
 
+Routes on that port: `GET /api/health`, `GET /api/sweep`, `GET /api/zoom?freq_hz=`, `POST /api/listen`, `POST /api/listen/stop`, and `GET /api/audio` (48 kHz mono s16le). `listen` prints the −6 dB width returned by `/api/zoom`. Demod uses SciPy.
+
 ## Running
 
 Use the wrapper script (recommended):
