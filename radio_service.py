@@ -259,6 +259,23 @@ class RadioService:
         self._work_queue.put(("sweep", start_hz, stop_hz, result_q))
         return result_q.get(timeout=30)
 
+    def zoom(self, freq_hz: float, passes: int = 3) -> dict:
+        """Retune to freq_hz and return a short spectrum + waterfall for the UI.
+
+        Posts work to the owner thread (the only IQ reader) and blocks until
+        results are ready. All floats in the returned dict are Python float.
+
+        Returns:
+            spectrum_db: list[float] — power in dB relative to the peak (0 = max)
+            waterfall:   list[list[float]] — one row per pass, same normalization
+            peak_hz:     float — frequency of the peak bin
+            bandwidth_hz:float — contiguous −6 dB bandwidth around the peak
+            label:       str — band label from classify()
+        """
+        result_q: queue.Queue = queue.Queue()
+        self._work_queue.put(("zoom", freq_hz, passes, result_q))
+        return result_q.get(timeout=30)
+
     def listen(self, freq_hz: float, mode: str) -> None:
         """Tune to freq_hz and demodulate.
 
@@ -310,11 +327,83 @@ class RadioService:
                 while retune[0] is not None:
                     retune = self._do_listen(*retune)
 
+            elif kind == "zoom":
+                _, freq_hz, passes, result_q = item
+                try:
+                    result = self._do_zoom(freq_hz, passes)
+                except Exception as exc:
+                    result = {"error": str(exc)}
+                result_q.put(result)
+
             elif kind == "stop_listen":
                 # TODO peak-log: append timestamp, Hz, dBm, label; alert when is_new flips
                 _, result_q = item
                 self._listening = False
                 result_q.put({"ok": True})
+
+    def _do_zoom(self, freq_hz: float, passes: int = 3) -> dict:
+        """Read 'passes' IQ blocks centred on freq_hz and build the zoom response.
+
+        All power values are normalised so the global peak = 0 dB (relative).
+        The -6 dB bandwidth is the contiguous range of bins within 6 dB of peak.
+        Palmetto frequencies are allowed through (zoom ≠ listen).
+        """
+        label = classify(freq_hz)
+
+        spectra_db: list[np.ndarray] = []
+        freqs: np.ndarray | None = None
+
+        for _ in range(max(1, passes)):
+            iq = self._reader(freq_hz)
+            if iq is None:
+                break
+            iq = np.asarray(iq)
+            if iq.size == 0:
+                break
+            f, p = _iq_to_spectrum(iq, freq_hz)
+            if f.size == 0:
+                break
+            if freqs is None:
+                freqs = f
+            spectra_db.append(p)
+
+        if not spectra_db or freqs is None:
+            return {
+                "spectrum_db": [],
+                "waterfall": [],
+                "peak_hz": float(freq_hz),
+                "bandwidth_hz": 0.0,
+                "label": label,
+            }
+
+        # Global peak across all passes — normalise everything to this.
+        global_peak = float(max(p.max() for p in spectra_db))
+        norm = [p - global_peak for p in spectra_db]
+
+        first = norm[0]
+        peak_idx = int(np.argmax(first))
+        peak_hz = float(freqs[peak_idx])
+
+        # Contiguous -6 dB bandwidth around the peak bin.
+        left = peak_idx
+        while left > 0 and first[left - 1] >= -6.0:
+            left -= 1
+        right = peak_idx
+        while right < len(first) - 1 and first[right + 1] >= -6.0:
+            right += 1
+        if right > left:
+            bandwidth_hz = float(freqs[right] - freqs[left])
+        else:
+            bin_width = float(freqs[1] - freqs[0]) if len(freqs) > 1 else 0.0
+            bandwidth_hz = bin_width
+
+        return {
+            "spectrum_db": [float(v) for v in first],
+            "waterfall": [[float(v) for v in row] for row in norm],
+            "peak_hz": peak_hz,
+            "bandwidth_hz": bandwidth_hz,
+            "label": label,
+        }
 
     def _connect_hardware(self) -> None:
         """Open the RtlSdr dongle. Only called when reader is None (live hardware)."""
@@ -449,6 +538,14 @@ class RadioService:
                         start_hz = float(start_val) * 1e6
                         stop_hz = float(stop_val) * 1e6
                     result = service.sweep(start_hz, stop_hz)
+                    self._send_json(200, result)
+
+                elif path == "/api/zoom":
+                    freq_val = params.get("freq_hz", [None])[0]
+                    if freq_val is None:
+                        self._send_json(400, {"error": "freq_hz is required"})
+                        return
+                    result = service.zoom(float(freq_val))
                     self._send_json(200, result)
 
                 elif path == "/api/audio":

@@ -1,6 +1,6 @@
 import builtins
 
-from radio import ensure_sounddevice, format_hits, stop_listen
+from radio import _build_parser, ensure_sounddevice, format_hits, stop_listen
 
 
 def test_format_orders_reasons():
@@ -49,3 +49,39 @@ def test_ensure_sounddevice_missing_hint(capsys, monkeypatch):
     captured = capsys.readouterr()
     assert code == 1
     assert "uv pip install sounddevice" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# C1: --device and --port must be accepted after the subcommand name
+# ---------------------------------------------------------------------------
+
+def test_device_after_play_subcommand():
+    """play --band fm --device 1 must parse device=1 (C1)."""
+    parser = _build_parser()
+    args = parser.parse_args(["play", "--band", "fm", "--device", "1"])
+    assert args.command == "play"
+    assert args.band == "fm"
+    assert args.device == 1
+
+
+def test_device_after_scan_subcommand():
+    """scan --band fm --device 1 must parse device=1 (C1)."""
+    parser = _build_parser()
+    args = parser.parse_args(["scan", "--band", "fm", "--device", "1"])
+    assert args.command == "scan"
+    assert args.device == 1
+
+
+def test_device_after_listen_subcommand():
+    """listen --freq 88.5 --device 1 must parse device=1 (C1)."""
+    parser = _build_parser()
+    args = parser.parse_args(["listen", "--freq", "88.5", "--device", "1"])
+    assert args.command == "listen"
+    assert args.device == 1
+
+
+def test_port_after_play_subcommand():
+    """play --band fm --port 9000 must parse port=9000 (C1)."""
+    parser = _build_parser()
+    args = parser.parse_args(["play", "--band", "fm", "--port", "9000"])
+    assert args.port == 9000

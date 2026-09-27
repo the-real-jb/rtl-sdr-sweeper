@@ -214,7 +214,10 @@ def _cmd_listen(args: argparse.Namespace) -> int:
     if mode is None:
         print(_SDRTRUNK_PATH)
         return 2
-    return _start_listen(base, freq_hz, mode)
+    # Zoom to get the measured -6 dB bandwidth before starting audio.
+    zoom = _fetch_json(f"{base}/api/zoom?{urlencode({'freq_hz': freq_hz})}")
+    bw = float(zoom.get("bandwidth_hz", 0.0))
+    return _start_listen(base, freq_hz, mode, bandwidth_hz=bw)
 
 
 def _cmd_play(args: argparse.Namespace) -> int:
@@ -275,15 +278,22 @@ def _build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--band", choices=list(BANDS.keys()))
     scan.add_argument("--start", type=float)
     scan.add_argument("--stop", type=float)
+    # C1: --device/--port may appear after the subcommand name (e.g. play --band fm --device 1)
+    scan.add_argument("--device", type=int, default=0)
+    scan.add_argument("--port", type=int, default=_DEFAULT_PORT)
 
     listen = sub.add_parser("listen")
     listen.add_argument("--freq", type=float, required=True)
     listen.add_argument("--mode", choices=["wfm", "nfm", "am"])
+    listen.add_argument("--device", type=int, default=0)
+    listen.add_argument("--port", type=int, default=_DEFAULT_PORT)
 
     play = sub.add_parser("play")
     play.add_argument("--band", choices=list(BANDS.keys()))
     play.add_argument("--start", type=float)
     play.add_argument("--stop", type=float)
+    play.add_argument("--device", type=int, default=0)
+    play.add_argument("--port", type=int, default=_DEFAULT_PORT)
     return parser
 
 

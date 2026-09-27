@@ -143,6 +143,91 @@ def test_audio_sends_json_frame(http_service):
 
 
 # ---------------------------------------------------------------------------
+# I1: GET /api/zoom
+# ---------------------------------------------------------------------------
+
+
+def test_zoom_returns_spectrum(http_service):
+    """GET /api/zoom?freq_hz= must return spectrum, waterfall, peak_hz, bandwidth_hz, label."""
+    raw = urlopen(http_service + "/api/zoom?freq_hz=144390000").read()
+    body = json.loads(raw)
+    # Required keys
+    assert "spectrum_db" in body, f"missing spectrum_db: {list(body)}"
+    assert "waterfall" in body
+    assert "peak_hz" in body
+    assert "bandwidth_hz" in body
+    assert "label" in body
+    # spectrum_db must be relative to peak (0 is max)
+    spec = body["spectrum_db"]
+    assert len(spec) > 0
+    assert max(spec) == pytest.approx(0.0, abs=0.01), "spectrum_db must be relative to peak (0 at top)"
+    # All spectrum_db values must be non-positive
+    assert all(v <= 0.0 for v in spec), "spectrum_db values must be <= 0"
+    # Floats must be plain Python floats, not numpy scalars (json.dumps would reject np.float64)
+    assert isinstance(body["peak_hz"], float)
+    assert isinstance(body["bandwidth_hz"], float)
+    # Label must be a string
+    assert isinstance(body["label"], str)
+    # Waterfall must be a list of lists
+    assert isinstance(body["waterfall"], list)
+    assert all(isinstance(row, list) for row in body["waterfall"])
+
+
+def test_zoom_missing_freq_returns_400(http_service):
+    """GET /api/zoom with no freq_hz must return 400."""
+    try:
+        urlopen(http_service + "/api/zoom")
+        assert False, "expected 400"
+    except Exception as exc:
+        assert "400" in str(exc)
+
+
+def test_zoom_palmetto_ok(http_service):
+    """GET /api/zoom on a Palmetto frequency must succeed (zoom != listen)."""
+    raw = urlopen(http_service + "/api/zoom?freq_hz=852350000").read()
+    body = json.loads(raw)
+    assert "spectrum_db" in body
+    assert body["label"] == "palmetto800"
+
+
+# ---------------------------------------------------------------------------
+# I2: Audio WebSocket binary frame (s16le, rate 48000, mono)
+# ---------------------------------------------------------------------------
+
+
+def test_audio_binary_frame_is_s16le(http_service):
+    """I2: After the hello JSON, the next binary frame must contain valid s16le samples."""
+    import numpy as np
+
+    # Start a listen so the demod loop produces audio frames
+    data = json.dumps({"freq_hz": 144.0e6, "mode": "nfm"}).encode()
+    urlopen(Request(
+        http_service + "/api/listen",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    ))
+
+    ws_url = http_service.replace("http://", "ws://") + "/api/audio"
+    with websockets.sync.client.connect(ws_url) as ws:
+        # First frame: JSON hello
+        hello = ws.recv()
+        hello_data = json.loads(hello)
+        assert hello_data == {"rate": 48000, "channels": 1, "format": "s16le"}
+
+        # Second frame: binary PCM
+        ws.socket.settimeout(5.0)
+        frame = ws.recv()
+
+    assert isinstance(frame, bytes), f"expected bytes, got {type(frame)}"
+    assert len(frame) > 0, "binary frame must not be empty"
+    assert len(frame) % 2 == 0, "s16le frames must have even byte count"
+    samples = np.frombuffer(frame, dtype=np.int16)
+    assert samples.dtype == np.int16, "samples must be int16 (s16le, mono)"
+    # Rate and channels are asserted via hello_data above (48000, 1)
+
+
+# ---------------------------------------------------------------------------
 # Module-level TODO marker check
 # ---------------------------------------------------------------------------
 
