@@ -1,0 +1,6 @@
+numpy
+pyrtlsdr
+pytest
+scipy
+sounddevice
+websockets

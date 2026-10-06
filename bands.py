@@ -39,6 +39,21 @@ _PALMETTO_HIGH = (851e6, 861e6)
 _MARINE = (156e6, 162e6)
 _ISM_433 = (433.05e6, 434.79e6)
 
+# SE-US analog voice rotation for burst-chatter monitor (name, start_hz, stop_hz).
+# Entries named *_no_autolisten are for identification only (Palmetto P25); classify
+# already returns palmetto800 and listen_mode refuses demod.
+CHATTER_BANDS: list[tuple[str, float, float]] = [
+    ("air", 118e6, 137e6),
+    ("murs", 151.82e6, 154.60e6),
+    ("marine_rail", 156e6, 162e6),
+    ("ham2m", 144e6, 148e6),
+    ("ism433", 433.05e6, 434.79e6),
+    ("ham70cm", 420e6, 450e6),
+    ("gmrs", 462.55e6, 467.725e6),
+    ("palmetto800_low_no_autolisten", *_PALMETTO_LOW),
+    ("palmetto800_high_no_autolisten", *_PALMETTO_HIGH),
+]
+
 
 def _in_range(freq_hz: float, low_hz: float, high_hz: float) -> bool:
     return low_hz <= freq_hz <= high_hz
