@@ -2,14 +2,14 @@
 # Radio backend: serve the localhost API or run the CLI client.
 #
 # With no subcommand, starts radio_service on 127.0.0.1 (default port 8766).
-# scan / listen / play are forwarded to radio.py (HTTP client, no dongle in-process).
+# scan / listen / play / monitor are forwarded to radio.py (HTTP client, no dongle in-process).
 set -euo pipefail
 
 export LD_LIBRARY_PATH="$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
 cd "$(dirname "$0")"
 
 case "${1:-}" in
-  scan|listen|play)
+  scan|listen|play|monitor)
     exec .venv/bin/python radio.py "$@"
     ;;
 esac

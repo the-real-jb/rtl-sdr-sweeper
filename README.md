@@ -1,5 +1,7 @@
 # RTL-SDR Frequency Sweeper
 
+**Start here:** [QUICKSTART.md](QUICKSTART.md) — venv, first `scan` / `listen` / `play` session, band names, HTTP API, and legacy sweeper/viewer commands.
+
 Scans frequencies with an RTL-SDR dongle and reports detected signals. Power
 estimates, peak picking, the FFT, and bandwidth math run without hardware and
 are covered by pytest. Sample capture, the dwell between buffers, and dongle
@@ -59,22 +61,45 @@ One dongle is open at a time. Relative power is the measurement throughout.
 
 ## Radio backend
 
-`./run_radio.sh` starts the API on http://127.0.0.1:8766 (default device 0). Subcommands talk to that service:
+`radio_service.py` owns one dongle on a worker thread. `radio.py` is an HTTP client only (`scan`, `listen`, `play`). `./run_radio.sh` with no subcommand starts the API on http://127.0.0.1:8766 (default `--device 0`, `--port 8766`). Subcommands auto-start the service if health checks fail.
 
 ```bash
-./run_radio.sh scan --band fm              # 88–108 MHz interesting hits
-./run_radio.sh scan                        # default band activity (118–174 MHz)
-./run_radio.sh listen --freq 88.5 --mode wfm
-./run_radio.sh play --band fm              # scan, pick a hit number, listen
+./run_radio.sh --device 0                   # serve API (optional; scan/listen/play can start it)
+./run_radio.sh scan --band fm --device 1    # 88–108 MHz hits on dongle 1
+./run_radio.sh scan --device 0              # activity 118–174 MHz (default band)
+./run_radio.sh listen --freq 88.5 --device 0
+./run_radio.sh play --band fm --device 1    # scan, prompt: Hit number (q to quit):
 ```
 
-Named bands: `fm` (88–108 MHz), `air` (118–137), `ham2m` (144–148), `ham70cm` (420–450), `activity` (118–174, default when `scan` has no `--band` or `--start`).
+Flags: `--device`, `--port` on the root parser or on `scan` / `listen` / `play`. `scan` and `play` accept `--band` (`fm`, `air`, `ham2m`, `ham70cm`, `activity`) or `--start` / `--stop` in MHz (both required if either is set). `listen` requires `--freq` (MHz); `--mode` is optional (`wfm`, `nfm`, `am`).
 
-Hits are ranked by reason — `hunt` (watch frequencies), then `narrow_in_wide` (narrow carriers in FM broadcast), `voice` (air/marine/ham), then `active` — strongest relative dBm first within each group. Palmetto 800 (`769–775` / `851–861` MHz) returns HTTP 409; the CLI prints the SDRTrunk launcher path and exits 2.
+**Named bands (MHz):** `fm` 88–108, `air` 118–137, `ham2m` 144–148, `ham70cm` 420–450, `activity` 118–174 (default when `scan` / `play` omit band and custom range).
 
-If the dongle is busy (`LIBUSB_ERROR_BUSY`), the CLI prints the error string from `GET /api/health` and exits non-zero.
+**Hit lines** (from `scan` / `play`): index, MHz, relative power (dB), −6 dB bandwidth (kHz), label (`fm_broadcast`, `airband_am`, `nfm_voice`, …), `(reason)`. Sort order: `hunt` → `narrow_in_wide` → `voice` → `active`, strongest first within each group. `hunt` = within 25 kHz of watch list in `bands.HUNT_HZ`; `narrow_in_wide` = FM broadcast label with bandwidth under 50 kHz; `voice` = air or NFM voice labels; `active` = other FFT detections (median + 5 dB floor per hop). No hits: `No hits.`
 
-Routes on that port: `GET /api/health`, `GET /api/sweep`, `GET /api/zoom?freq_hz=`, `POST /api/listen`, `POST /api/listen/stop`, and `GET /api/audio` (48 kHz mono s16le). `listen` prints the −6 dB width returned by `/api/zoom`. Demod uses SciPy.
+**Listen:** calls `GET /api/zoom?freq_hz=` then prints `MHz  kHz  label` before WebSocket audio. Ctrl+C stops playback and `POST /api/listen/stop`.
+
+**Palmetto 800** (769–775 / 851–861 MHz): `POST /api/listen` → 409; CLI prints `/home/jb/apps/sdr-trunk-linux-x86_64-v0.6.1/bin/sdr-trunk` and exits 2.
+
+**Health / busy dongle:** `GET /api/health` returns `open` and `error` (e.g. `LIBUSB_ERROR_BUSY`). CLI prints `error` and exits non-zero.
+
+**Routes (localhost only):**
+
+| Method | Path |
+|--------|------|
+| GET | `/api/health` |
+| GET | `/api/sweep?start=&stop=` (MHz; default activity if omitted) |
+| GET | `/api/zoom?freq_hz=` (Hz) |
+| POST | `/api/listen` JSON `freq_hz`, `mode` |
+| POST | `/api/listen/stop` |
+| GET | `/api/audio` (WebSocket, 48 kHz mono s16le) |
+
+```bash
+curl -s 'http://127.0.0.1:8766/api/sweep?start=88&stop=108'
+curl -s 'http://127.0.0.1:8766/api/zoom?freq_hz=88500000'
+```
+
+Demod uses SciPy. Speaker output uses `sounddevice` + `websockets` (in `requirements.txt`).
 
 ## Running
 
@@ -108,7 +133,7 @@ cmake .. -DCMAKE_INSTALL_PREFIX=$HOME/.local -DINSTALL_UDEV_RULES=OFF -DDETACH_K
 make -j$(nproc) && make install
 ```
 
-pyrtlsdr finds it via `LD_LIBRARY_PATH`, which `run_sweeper.sh` and `run_viewer.sh` set automatically:
+pyrtlsdr finds it via `LD_LIBRARY_PATH`, which `run_radio.sh`, `run_sweeper.sh`, and `run_viewer.sh` set automatically:
 
 ```bash
 export LD_LIBRARY_PATH="$HOME/.local/lib:$LD_LIBRARY_PATH"

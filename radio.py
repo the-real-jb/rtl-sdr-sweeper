@@ -1,6 +1,6 @@
 """CLI client for the radio backend HTTP API.
 
-Owns scan/listen/play commands, hit formatting, and speaker playback via
+Owns scan/listen/play/monitor commands, hit formatting, and speaker playback via
 sounddevice. Never opens a dongle — all RF work stays in radio_service.py.
 """
 
@@ -18,7 +18,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request
 
-from bands import BANDS, classify, listen_mode
+from bands import BANDS, CHATTER_BANDS, classify, listen_mode
+from hits import Hit
+from tracker import OccupancyEvent, OccupancyTracker
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8766
@@ -173,6 +175,188 @@ def _play_audio_ws(base_url: str) -> None:
                 stream.write(pcm)
 
 
+def _play_audio_for(base_url: str, duration_s: float) -> None:
+    """Play WebSocket audio for up to duration_s seconds, then return."""
+    import numpy as np
+    import sounddevice as sd
+    import websockets.sync.client
+
+    if duration_s <= 0:
+        return
+    ws_url = base_url.replace("http://", "ws://") + "/api/audio"
+    deadline = time.monotonic() + duration_s
+    with websockets.sync.client.connect(ws_url) as ws:
+        meta = json.loads(ws.recv())
+        rate = int(meta["rate"])
+        with sd.OutputStream(samplerate=rate, channels=1, dtype="int16") as stream:
+            while time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                try:
+                    frame = ws.recv(timeout=max(0.05, min(remaining, 0.5)))
+                except TimeoutError:
+                    continue
+                if isinstance(frame, str):
+                    continue
+                pcm = np.frombuffer(frame, dtype=np.int16)
+                stream.write(pcm)
+
+
+def _hits_from_dicts(raw: list[dict]) -> list[Hit]:
+    return [
+        Hit(
+            freq_hz=float(h["freq_hz"]),
+            power_db=float(h["power_db"]),
+            bandwidth_hz=float(h["bandwidth_hz"]),
+            label=str(h["label"]),
+            reason=str(h["reason"]),
+            is_new=bool(h.get("is_new", False)),
+        )
+        for h in raw
+    ]
+
+
+def _is_chatter_candidate(event: OccupancyEvent) -> bool:
+    """True if this ranked event should auto-dwell (not sticky FM / digital)."""
+    if listen_mode(event.label) is None:
+        return False
+    if event.label == "fm_broadcast" and event.kind == "persistent":
+        return False
+    return True
+
+
+def _pick_candidate(ranked: list[OccupancyEvent]) -> OccupancyEvent | None:
+    """First ranked event that is eligible for auto-listen."""
+    for event in ranked:
+        if event.label == "palmetto800":
+            continue
+        if _is_chatter_candidate(event):
+            return event
+    return None
+
+
+def _signal_near_center(
+    zoom: dict, freq_hz: float, *, match_hz: float = 50_000.0, min_bw_hz: float = 5_000.0
+) -> bool:
+    """Heuristic: zoom peak near center with some bandwidth ⇒ still occupied."""
+    peak = float(zoom.get("peak_hz", 0.0))
+    bw = float(zoom.get("bandwidth_hz", 0.0))
+    if abs(peak - freq_hz) > match_hz:
+        return False
+    return bw >= min_bw_hz
+
+
+def _dwell_on_candidate(
+    base_url: str,
+    event: OccupancyEvent,
+    *,
+    max_dwell_s: float = 9.0,
+    quiet_check_s: float = 1.5,
+) -> None:
+    """POST listen, play audio until quiet zoom checks or max dwell, then stop."""
+    mode = listen_mode(event.label)
+    if mode is None:
+        print(_SDRTRUNK_PATH)
+        return
+
+    print(
+        f"{event.freq_hz / 1e6:.4f} MHz  {event.label}  "
+        f"duty={event.duty:.2f}  ({event.reason})"
+    )
+    payload = json.dumps({"freq_hz": event.freq_hz, "mode": mode}).encode()
+    result = _fetch_json(f"{base_url}/api/listen", data=payload, method="POST")
+    if result.get("_http_code") == 409:
+        print(_SDRTRUNK_PATH)
+        return
+    if ensure_sounddevice() != 0:
+        stop_listen(base_url)
+        return
+
+    deadline = time.monotonic() + max_dwell_s
+    try:
+        while time.monotonic() < deadline:
+            slice_s = min(quiet_check_s, deadline - time.monotonic())
+            if slice_s <= 0:
+                break
+            try:
+                _play_audio_for(base_url, slice_s)
+            except Exception:
+                break
+            stop_listen(base_url)
+            if time.monotonic() >= deadline:
+                break
+            zoom = _fetch_json(
+                f"{base_url}/api/zoom?{urlencode({'freq_hz': event.freq_hz})}"
+            )
+            if not _signal_near_center(zoom, event.freq_hz):
+                return
+            # Still occupied — retune and keep playing until dwell ends.
+            result = _fetch_json(
+                f"{base_url}/api/listen", data=payload, method="POST"
+            )
+            if result.get("_http_code") == 409:
+                return
+    except KeyboardInterrupt:
+        raise
+    finally:
+        try:
+            stop_listen(base_url)
+        except Exception:
+            pass
+
+
+def run_monitor(
+    base_url: str,
+    *,
+    bands: list[tuple[str, float, float]] | None = None,
+    max_cycles: int | None = None,
+    max_dwell_s: float = 9.0,
+    quiet_check_s: float = 1.5,
+    tracker: OccupancyTracker | None = None,
+) -> int:
+    """Rotate CHATTER_BANDS: sweep → rank → auto-dwell → resume until Ctrl+C."""
+    rotation = bands if bands is not None else CHATTER_BANDS
+    occ = tracker if tracker is not None else OccupancyTracker()
+    cycles = 0
+    try:
+        while max_cycles is None or cycles < max_cycles:
+            for _name, start_hz, stop_hz in rotation:
+                url = (
+                    f"{base_url}/api/sweep?"
+                    f"{urlencode({'start': start_hz / 1e6, 'stop': stop_hz / 1e6})}"
+                )
+                body = _fetch_json(url)
+                hits = _hits_from_dicts(body.get("hits", []))
+                events = occ.update(hits)
+                candidate = _pick_candidate(occ.rank(events))
+                if candidate is not None:
+                    _dwell_on_candidate(
+                        base_url,
+                        candidate,
+                        max_dwell_s=max_dwell_s,
+                        quiet_check_s=quiet_check_s,
+                    )
+            cycles += 1
+    except KeyboardInterrupt:
+        try:
+            stop_listen(base_url)
+        except Exception:
+            pass
+        print("\nmonitor stopped.", file=sys.stderr)
+    return 0
+
+
+def _cmd_monitor(args: argparse.Namespace) -> int:
+    base = _ensure_service(args.device, args.port)
+    code = _check_health(base)
+    if code:
+        return code
+    print(
+        f"Monitoring chatter bands on {base} (Ctrl+C to stop)…",
+        flush=True,
+    )
+    return run_monitor(base)
+
+
 def _start_listen(
     base_url: str, freq_hz: float, mode: str, *, bandwidth_hz: float | None = None
 ) -> int:
@@ -294,6 +478,10 @@ def _build_parser() -> argparse.ArgumentParser:
     play.add_argument("--stop", type=float)
     play.add_argument("--device", type=int, default=0)
     play.add_argument("--port", type=int, default=_DEFAULT_PORT)
+
+    monitor = sub.add_parser("monitor")
+    monitor.add_argument("--device", type=int, default=0)
+    monitor.add_argument("--port", type=int, default=_DEFAULT_PORT)
     return parser
 
 
@@ -309,6 +497,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_listen(args)
     if args.command == "play":
         return _cmd_play(args)
+    if args.command == "monitor":
+        return _cmd_monitor(args)
     parser.print_help()
     return 1
 
